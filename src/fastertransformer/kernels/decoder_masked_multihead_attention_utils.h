@@ -1,3 +1,4 @@
+#include <cstdio>
 /*
  * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
