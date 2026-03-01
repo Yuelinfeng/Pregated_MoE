@@ -74,7 +74,23 @@ def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, c
 
     total_experts = int(re.search(r"\d+", model)[0])
 
-    arena_size = 21474836480
+    # arena_size = 21474836480
+    
+    # 自动获取当前 0 号显卡的剩余可用显存和总显存 (单位：字节)
+    free_mem, total_mem = torch.cuda.mem_get_info(0)
+    # 策略：拿走当前剩余可用显存的一半 (50%) 丢给底层做预取池，
+    # 剩下的 50% 留给 PyTorch 加载模型本身和上下文 KV Cache 慢慢用。
+    # 如果你的 batch_size 比较小，可以改到 0.7 或 0.8。
+    
+    # 根据预测模式判断是否需要庞大的底座显存水池
+    if method == "GPU-only" or method == "DeepSpeed":
+        # 如果是全显存常驻模式，不需要缓冲池，只象征性给 1GB 保证 C++ 不报错
+        arena_size = 1024 * 1024 * 1024 
+    else:
+        # Pre-gated 和 SE-MoE 等需要频繁搬运卸载的策略，给它分配剩下的一半(50%)做高速预取内存
+        arena_size = int(free_mem * 0.5)
+    print(f"\n{arena_size}\n")
+    
     use_cache = 0
     if cache_ratio != 0:
         use_cache = 1
@@ -126,8 +142,13 @@ def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, c
         cwd="/workspace/FasterTransformer/build"
     )
 
+    if result.returncode != 0:
+        print(f"\n[ERROR] Command failed with return code {result.returncode}")
+        print(f"STDERR:\n{result.stderr}\n")
+
     with open(f"/workspace/FasterTransformer/logs/{exp_name}.log", "w") as fp:
         fp.write(result.stdout)
+        fp.write("\nSTDERR:\n" + result.stderr)
 
     block_lat, throughput, peak_mem_encoder, peak_mem_decoder, max_active_experts, cache_hit_rate = parse_output(result.stdout)
 
@@ -175,14 +196,14 @@ def main():
         "switch-base-8",
         "switch-base-64",
         "switch-base-128",
-        "switch-large-128",
+        # "switch-large-128",
     ]
     batch_sizes = [
         1,
-        # 2,
-        # 4,
-        # 8,
-        # 16,
+        2,
+        4,
+        8,
+        16,
     ]
     methods = [
         "GPU-only",
