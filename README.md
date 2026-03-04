@@ -20,7 +20,7 @@ git clone --recursive https://github.com/Yuelinfeng/Pregated_MoE.git FasterTrans
 # build on A100
 mkdir -p FasterTransformer/build
 cd FasterTransformer/build
-cmake -DSM=80 -DCMAKE_BUILD_TYPE=Release -DBUILD_PYT=ON -DBUILD_MULTI_GPU=ON ..
+cmake -DSM=89 -DCMAKE_BUILD_TYPE=Release -DBUILD_PYT=ON -DBUILD_MULTI_GPU=OFF ..
 make -j
 ```
 * Note: Replace `${DATA_PATH}` with path on host.
