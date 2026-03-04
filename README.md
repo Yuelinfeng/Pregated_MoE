@@ -13,11 +13,15 @@ This open-source project is for proof of concept purposes only and should not be
 ## Setup
 
 ```bash
+# Create Conda environment
+conda create -n pregated python=3.9 -y
+conda activate pregated
+
 # Starting from the official container
 docker run -ti --gpus all --shm-size 5g --name pregated -v ${DATA_PATH}:/data nvcr.io/nvidia/pytorch:22.09-py3 bash
 git clone --recursive https://github.com/Yuelinfeng/Pregated_MoE.git FasterTransformer
 
-# build on A100
+# build on 4090D
 mkdir -p FasterTransformer/build
 cd FasterTransformer/build
 cmake -DSM=89 -DCMAKE_BUILD_TYPE=Release -DBUILD_PYT=ON -DBUILD_MULTI_GPU=OFF ..
@@ -45,9 +49,16 @@ pip install -r ../examples/pytorch/t5/requirement.txt
 ## Prepare models
 
 ```bash
+# option one
 mkdir /data/ft
 cd /workspace/FasterTransformer/
 ./scripts/convert.sh
+
+# option two on autodl
+mkdir -p ~/autodl-tmp/data/ft
+ln -sfn ~/autodl-tmp/data /data
+mkdir -p /workspace
+ln -sfn ~/autodl-tmp/FasterTransformer /workspace/FasterTransformer
 ```
 
 ## Evaluation
