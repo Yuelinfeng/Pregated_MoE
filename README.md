@@ -15,7 +15,7 @@ This open-source project is for proof of concept purposes only and should not be
 ```bash
 # Starting from the official container
 docker run -ti --gpus all --shm-size 5g --name pregated -v ${DATA_PATH}:/data nvcr.io/nvidia/pytorch:22.09-py3 bash
-git clone --recursive https://github.com/ranggihwang/Pregated_MoE.git FasterTransformer
+git clone --recursive https://github.com/Yuelinfeng/Pregated_MoE.git FasterTransformer
 
 # build on A100
 mkdir -p FasterTransformer/build
