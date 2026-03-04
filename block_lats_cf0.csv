@@ -1,0 +1,6 @@
+bs,active experts,cache ratio,CPU,RAM (GB),GPU,switch-base-8/CF-MoE/CPU,switch-base-64/CF-MoE/CPU
+1,0,0,Intel(R) Xeon(R) Gold 6342 CPU @ 2.80GHz,503,NVIDIA GeForce RTX 4090 D,6.41486,51.1774
+2,0,0,Intel(R) Xeon(R) Gold 6342 CPU @ 2.80GHz,503,NVIDIA GeForce RTX 4090 D,6.38308,51.0188
+4,0,0,Intel(R) Xeon(R) Gold 6342 CPU @ 2.80GHz,503,NVIDIA GeForce RTX 4090 D,6.40391,51.0156
+8,0,0,Intel(R) Xeon(R) Gold 6342 CPU @ 2.80GHz,503,NVIDIA GeForce RTX 4090 D,6.4075,51.1451
+16,0,0,Intel(R) Xeon(R) Gold 6342 CPU @ 2.80GHz,503,NVIDIA GeForce RTX 4090 D,6.38843,50.9751

@@ -1,4 +1,5 @@
-for model in switch-base-8 switch-base-64 switch-base-128 switch-large-128
+for model in switch-base-8 switch-base-64
+# switch-base-128 switch-large-128
 do
     echo $model
     rm -rf /data/ft/$model

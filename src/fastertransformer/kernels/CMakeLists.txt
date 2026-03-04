@@ -233,3 +233,7 @@ add_library(moe_kernels STATIC moe_kernels.cu)
 set_property(TARGET moe_kernels PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET moe_kernels PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(moe_kernels PRIVATE moe_gemm_kernels)
+
+add_library(cf_kernels STATIC cf_kernels.cu)
+set_property(TARGET cf_kernels PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET cf_kernels PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)

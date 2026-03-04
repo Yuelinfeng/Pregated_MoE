@@ -64,6 +64,9 @@ def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, c
         encoder_fetcher_mode = "1"
         decoder_fetcher_mode = "2"
         iterations = 1
+    elif method == "CF-MoE":
+        encoder_fetcher_mode = "1"   # Encoder 仍用按需拉取
+        decoder_fetcher_mode = "3"   # Decoder 用 CF_PREFETCH
 
     if "base" in model:
         size_per_expert = 18874368
@@ -87,7 +90,7 @@ def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, c
         # 如果是全显存常驻模式，不需要缓冲池，只象征性给 1GB 保证 C++ 不报错
         arena_size = 1024 * 1024 * 1024 
     else:
-        # Pre-gated 和 SE-MoE 等需要频繁搬运卸载的策略，给它分配剩下的一半(50%)做高速预取内存
+        # Pre-gated、SE-MoE、CF-MoE 等需要频繁搬运卸载的策略，给它分配剩下的一半(50%)做高速预取内存
         arena_size = int(free_mem * 0.5)
     print(f"\n{arena_size}\n")
     
@@ -112,6 +115,8 @@ def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, c
         "fetch_all": f"{int(method == 'SE-MoE')}",
         "forced_num_experts": f"{forced_num_expert}",
         "cache_policy": "LFU",
+        "cf_alpha": "0.8",
+        "cf_topk": "2",
     }
 
     with open("/workspace/FasterTransformer/cpp_config.ini", "w") as fp:
@@ -160,6 +165,8 @@ def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, c
         used_buffer = num_layer * total_experts
     elif method == "SE-MoE":
         used_buffer = 2 * total_experts
+    elif method == "CF-MoE":
+        used_buffer = 2 * max_active_experts  # 与 Pre-gated 类似的双缓冲
 
     peak_mem = peak_mem_decoder - arena_size - size_per_expert * (2 * total_experts - used_buffer)
     print(
@@ -194,8 +201,8 @@ def main():
 
     models = [
         "switch-base-8",
-        "switch-base-64",
-        "switch-base-128",
+        # "switch-base-64",
+        # "switch-base-128",
         # "switch-large-128",
     ]
     batch_sizes = [
@@ -206,10 +213,11 @@ def main():
         16,
     ]
     methods = [
-        "GPU-only",
-        "Pre-gated",
-        "DeepSpeed",
-        "SE-MoE",
+        # "GPU-only",
+        # "Pre-gated",
+        # "DeepSpeed",
+        # "SE-MoE",
+        "CF-MoE",
     ]
     metrics = [
         "block_lat",
