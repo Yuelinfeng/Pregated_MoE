@@ -200,9 +200,9 @@ def main():
     args = parse_args()
 
     models = [
-        "switch-base-8",
+        # "switch-base-8",
         # "switch-base-64",
-        # "switch-base-128",
+        "switch-base-128",
         # "switch-large-128",
     ]
     batch_sizes = [
@@ -211,12 +211,15 @@ def main():
         4,
         8,
         16,
+        32,
+        64,
+        128,
     ]
     methods = [
         # "GPU-only",
-        # "Pre-gated",
-        # "DeepSpeed",
-        # "SE-MoE",
+        "Pre-gated",
+        "DeepSpeed",
+        "SE-MoE",
         "CF-MoE",
     ]
     metrics = [

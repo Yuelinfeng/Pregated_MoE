@@ -490,23 +490,25 @@ void FetcherContext<ActT, WeightT, BiasT>::update_history(const int*   real_expe
 
     // === P2 fix: Online S-matrix update via Y^T * Y ===
     // Compute raw_YtY = Y^T * Y: [E x N] * [N x E] = [E x E]
-    // Using cuBLAS column-major: C = A^T * B where A=Y, B=Y
+    // In cuBLAS col-major, Y (row-major N x E) is M (col-major E x N).
+    // We want M * M^T = [E x N] * [N x E] = [E x E]
     const float alpha_s = 1.0f;
     const float beta_s  = 0.0f;
+    cublasSetStream(cf_cublas_handle_, ext_stream);
     cublasSgemm(cf_cublas_handle_,
-                CUBLAS_OP_T,
                 CUBLAS_OP_N,
+                CUBLAS_OP_T,
                 num_experts_,  // m
                 num_experts_,  // n
                 num_tokens,    // k
                 &alpha_s,
-                cf_Y_matrix_,  // A: [num_tokens x num_experts_] row-major = [num_experts_ x num_tokens] col-major
-                num_experts_,  // lda (leading dim of A in col-major storage)
-                cf_Y_matrix_,  // B: same as A
+                cf_Y_matrix_,
+                num_experts_,  // lda
+                cf_Y_matrix_,
                 num_experts_,  // ldb
                 &beta_s,
-                cf_YtY_buffer_,  // C: [num_experts_ x num_experts_]
-                num_experts_);   // ldc
+                cf_YtY_buffer_,
+                num_experts_);  // ldc
 
     // Row-normalize YtY and EMA blend into S: S = 0.95*S + 0.05*normalize(YtY)
     cf_normalize_and_update_S(cf_YtY_buffer_, cf_S_matrix_, 0.95f, num_experts_, ext_stream);
