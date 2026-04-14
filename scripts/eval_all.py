@@ -2,6 +2,7 @@ import configparser
 import subprocess
 import pandas as pd
 import re
+import math
 from cpuinfo import get_cpu_info
 import psutil
 import torch
@@ -45,6 +46,12 @@ def parse_output(output: str):
             cache_hit_rate = float(m[1])
     
     return block_lat, throughput, peak_mem_encoder, peak_mem_decoder, max_active_experts, cache_hit_rate
+
+
+def is_output_valid(output: str):
+    has_block_lat = re.search(r"BLK AVG: ([\d\.]+) ms", output) is not None
+    has_throughput = re.search(r", (\d+) tokens/sec\.", output) is not None
+    return has_block_lat or has_throughput
 
 
 def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, cache_ratio=0, disk_offload=0):
@@ -127,20 +134,45 @@ def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, c
     )
 
     with open(f"/workspace/FasterTransformer/logs/{exp_name}.log", "w") as fp:
+        fp.write("=== STDOUT ===\n")
         fp.write(result.stdout)
+        fp.write("\n=== STDERR ===\n")
+        fp.write(result.stderr)
+
+    if result.returncode != 0:
+        print(f"[WARN] Command failed with return code {result.returncode}. See logs/{exp_name}.log")
+        return {
+            "block_lat": math.nan,
+            "throughput": math.nan,
+            "peak_mem": math.nan,
+            "max_active_expert": math.nan,
+            "cache_hit_rate": math.nan,
+        }
 
     block_lat, throughput, peak_mem_encoder, peak_mem_decoder, max_active_experts, cache_hit_rate = parse_output(result.stdout)
 
-    if method == "Pre-gated":
-        used_buffer = 2 * max_active_experts
-    elif method == "DeepSpeed":
-        used_buffer = max_active_experts
-    elif method == "GPU-only":
-        used_buffer = num_layer * total_experts
-    elif method == "SE-MoE":
-        used_buffer = 2 * total_experts
+    if not is_output_valid(result.stdout):
+        print(f"[WARN] Failed to parse benchmark output. See logs/{exp_name}.log")
+        return {
+            "block_lat": math.nan,
+            "throughput": math.nan,
+            "peak_mem": math.nan,
+            "max_active_expert": math.nan,
+            "cache_hit_rate": math.nan,
+        }
 
-    peak_mem = peak_mem_decoder - arena_size - size_per_expert * (2 * total_experts - used_buffer)
+    peak_mem = math.nan
+    if peak_mem_decoder > 0:
+        if method == "Pre-gated":
+            used_buffer = 2 * max_active_experts
+        elif method == "DeepSpeed":
+            used_buffer = max_active_experts
+        elif method == "GPU-only":
+            used_buffer = num_layer * total_experts
+        elif method == "SE-MoE":
+            used_buffer = 2 * total_experts
+        peak_mem = peak_mem_decoder - arena_size - size_per_expert * (2 * total_experts - used_buffer)
+
     print(
         f"BLK AVG: {block_lat} ms, "
         f"throughput: {throughput} tokens/sec, "
