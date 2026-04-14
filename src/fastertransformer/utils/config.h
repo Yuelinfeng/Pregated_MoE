@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <memory>
 #include <iostream>
 #include "cutlass/numeric_types.h"
@@ -40,7 +41,11 @@ public:
 
     void loadDefault()
     {
-        mINI::INIFile file("/workspace/FasterTransformer/cpp_config.ini");
+        const char* env_config_path = std::getenv("PREGATED_CPP_CONFIG");
+        const std::string config_path =
+            env_config_path != nullptr && env_config_path[0] != '\0' ? env_config_path :
+                                                                     "/workspace/FasterTransformer/cpp_config.ini";
+        mINI::INIFile file(config_path);
         mINI::INIStructure ini;
         file.read(ini);
 

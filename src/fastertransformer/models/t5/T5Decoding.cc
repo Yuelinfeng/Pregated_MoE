@@ -21,6 +21,7 @@
 #include "src/fastertransformer/layers/beam_search_layers/BaseBeamSearchLayer.h"
 #include "src/fastertransformer/utils/profiling.h"
 #include "src/fastertransformer/utils/config.h"
+#include "src/fastertransformer/utils/prefetch_trace_logger.h"
 
 namespace fastertransformer {
 
@@ -1085,6 +1086,9 @@ void T5Decoding<T>::forward(TensorMap*                 output_tensors,
 
     if (GlobalConfig::instance().profiling) {
         Profiling::instance().report(GlobalConfig::instance().detailed_timing);
+        PrefetchTraceLogger::instance().recordRequestSummary(Profiling::instance().cacheHitRate(),
+                                                             Profiling::instance().maxActiveExperts(),
+                                                             Profiling::instance().averageActiveExperts());
     }
 }
 

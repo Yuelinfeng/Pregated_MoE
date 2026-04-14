@@ -48,6 +48,21 @@ public:
         average_num_active_experts_.update(num_active_experts);
     }
 
+    double cacheHitRate() const
+    {
+        return cache_hit_rate_.getAvg();
+    }
+
+    int maxActiveExperts() const
+    {
+        return max_num_active_experts_;
+    }
+
+    double averageActiveExperts() const
+    {
+        return average_num_active_experts_.getAvg();
+    }
+
 private:
     static constexpr int NUM_EVENT_TYPE = (int)EventType::COMP_END + 1;
 

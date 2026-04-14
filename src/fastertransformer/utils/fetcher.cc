@@ -8,6 +8,7 @@
 #include "cutlass/array.h"
 #include "cutlass/numeric_types.h"
 #include "src/fastertransformer/utils/cuda_utils.h"
+#include "src/fastertransformer/utils/prefetch_trace_logger.h"
 #include "src/fastertransformer/utils/profiling.h"
 #include "src/fastertransformer/utils/random.h"
 #include <chrono>
@@ -63,9 +64,9 @@ template<class ActT, class WeightT, class BiasT>
 void FetcherContext<ActT, WeightT, BiasT>::fetch(const int* permuted_experts, bool prefetch)
 {
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
-    if (last_time && prefetch) {
-        FT_LOG_TRACE("Abandon prefetching at final layer");
-        return;
+    const bool skip_prefetch_transfer = last_time && prefetch;
+    if (skip_prefetch_transfer) {
+        FT_LOG_TRACE("Skip weight transfer for the final prefetched layer");
     }
 
     check_cuda_error(cudaMemcpy(permuted_experts_,
@@ -73,11 +74,35 @@ void FetcherContext<ActT, WeightT, BiasT>::fetch(const int* permuted_experts, bo
                                 sizeof(int) * num_rows_,
                                 cudaMemcpyDeviceToHost));
 
+    std::vector<std::pair<int, int>> actual_counts;
+    actual_counts.reserve(num_rows_);
+    for (size_t idx = 0; idx < num_rows_; ++idx) {
+        const int expert = permuted_experts_[idx];
+        if (actual_counts.empty() || actual_counts.back().first != expert) {
+            actual_counts.emplace_back(expert, 1);
+        }
+        else {
+            ++actual_counts.back().second;
+        }
+    }
+
     auto new_end = std::unique(permuted_experts_, permuted_experts_ + num_rows_);
     num_active_experts_ = new_end - permuted_experts_;
 
+    PrefetchTraceLogger::instance().recordLayerEvent(current_layer_name_,
+                                                     next_layer_name_,
+                                                     actual_counts,
+                                                     static_cast<int>(num_experts_),
+                                                     first_time,
+                                                     last_time,
+                                                     prefetch && !skip_prefetch_transfer);
+
     if (GlobalConfig::instance().profiling) {
         Profiling::instance().activeExperts(num_active_experts_);
+    }
+
+    if (skip_prefetch_transfer) {
+        return;
     }
 
     if (GlobalConfig::instance().profiling) {
