@@ -16,6 +16,7 @@ import argparse
 import configparser
 import multiprocessing
 from datetime import datetime
+import gc
 import logging
 from pathlib import Path
 
@@ -184,6 +185,42 @@ def split_and_convert_process(key, val, factor, saved_dir):
         LOGGER.warning(f"cannot find key '{key}' with shape {val.shape}")
 
 
+def split_and_convert_worker(args):
+    split_and_convert_process(*args)
+    return None
+
+
+def convert_and_save_parameter(name, param, factor, saved_dir, np_weight_data_type):
+    array = param.detach().cpu().numpy().astype(np_weight_data_type, copy=False)
+    try:
+        split_and_convert_process(name, array, factor, saved_dir)
+    finally:
+        del array
+
+
+def convert_state_dict_sequential(model, factor, saved_dir, np_weight_data_type):
+    LOGGER.info("Using low-memory sequential conversion.")
+    for index, (name, param) in enumerate(model.state_dict().items(), start=1):
+        convert_and_save_parameter(name, param, factor, saved_dir, np_weight_data_type)
+        if index % 50 == 0:
+            gc.collect()
+
+
+def convert_state_dict_parallel(model, factor, saved_dir, np_weight_data_type, processes):
+    LOGGER.info(f"Using parallel conversion with {processes} workers.")
+    pool = multiprocessing.Pool(processes)
+    tasks = (
+        (name, param.detach().cpu().numpy().astype(np_weight_data_type, copy=False), factor, saved_dir)
+        for name, param in model.state_dict().items()
+    )
+    try:
+        for _ in pool.imap_unordered(split_and_convert_worker, tasks, chunksize=1):
+            pass
+    finally:
+        pool.close()
+        pool.join()
+
+
 def convert_checkpoint(args):
     saved_dir = Path(args.saved_dir) / f"{args.inference_tensor_para_size:d}-gpu"
     saved_dir.mkdir(parents=True, exist_ok=True)
@@ -228,13 +265,10 @@ def convert_checkpoint(args):
 
     i_gpu_num = args.inference_tensor_para_size
 
-    pool = multiprocessing.Pool(args.processes)
-    pool.starmap_async(split_and_convert_process,
-                       [(name, param.cpu().detach().numpy().astype(np_weight_data_type), i_gpu_num, saved_dir)
-                        for name, param in model.state_dict().items()])
-
-    pool.close()
-    pool.join()
+    if args.processes <= 1:
+        convert_state_dict_sequential(model, i_gpu_num, saved_dir, np_weight_data_type)
+    else:
+        convert_state_dict_parallel(model, i_gpu_num, saved_dir, np_weight_data_type, args.processes)
 
     if not args.encoder_only:
         fuse_decoder_qkv(model, i_gpu_num, saved_dir, np_weight_data_type)
@@ -248,8 +282,8 @@ if __name__ == "__main__":
     parser.add_argument("-in_file", "-i", type=str, help="file name of input checkpoint file", required=True)
     parser.add_argument("-inference_tensor_para_size", "-i_g", type=int, help="How many gpus for inference",
                         required=True)
-    parser.add_argument("-processes", "-p", type=int, help="How many processes to spawn for conversion (default: 4)",
-                        default=4)
+    parser.add_argument("-processes", "-p", type=int, help="How many processes to spawn for conversion (default: 1)",
+                        default=1)
     parser.add_argument("-weight_data_type", type=str, default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--encoder_only", "-e", action="store_true")
     parser.add_argument("--verbose", action="store_true", help="Provide verbose messages")
