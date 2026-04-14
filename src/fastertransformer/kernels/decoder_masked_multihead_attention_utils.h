@@ -1740,7 +1740,6 @@ template<>
 __device__ __inline__ void vec_from_smem_transpose(float4& vec, __nv_fp8_e4m3* smem, int transpose_idx, int smem_pitch)
 {
     // TODO
-    printf("[ERROR] still no have implementation for vec_from_smem_transpose under __nv_fp8_e4m3 \n");
 }
 #endif  // ENABLE_FP8
 
@@ -1849,7 +1848,6 @@ template<>
 __device__ __inline__ void
 write_smem_transpose(const float4& vec, __nv_fp8_e4m3* smem, int transpose_idx, int smem_pitch)
 {
-    printf("[ERROR] still no have implementation for vec_from_smem_transpose under __nv_fp8_e4m3 \n");
 }
 #endif  // ENABLE_FP8
 
