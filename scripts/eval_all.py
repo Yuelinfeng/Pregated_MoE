@@ -9,49 +9,110 @@ import torch
 import argparse
 
 
+FLOAT_RE = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|nan|inf"
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+
+def normalize_output(output: str):
+    output = output.replace("\r\n", "\n").replace("\r", "\n")
+    return ANSI_ESCAPE_RE.sub("", output)
+
+
+def parse_float(value: str):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return math.nan
+
+
 def parse_output(output: str):
-    block_lat = 0
+    output = normalize_output(output)
+
+    block_lat = math.nan
     for line in reversed(output.splitlines()):
-        m = re.search(r"BLK AVG: ([\d\.]+) ms", line)
+        m = re.search(rf"BLK AVG: ({FLOAT_RE}) ms", line)
         if m:
-            block_lat = float(m[1])
+            block_lat = parse_float(m[1])
             break
 
-    throughput = .0
+    throughput = math.nan
     for line in reversed(output.splitlines()):
-        m = re.search(r", (\d+) tokens/sec\.", line)
+        m = re.search(rf", ({FLOAT_RE}) tokens/sec\.", line)
         if m:
-            throughput = int(m[1])
+            throughput = parse_float(m[1])
             break
-    
-    peak_mem_encoder = peak_mem_decoder = 0
+
+    peak_mem_encoder = math.nan
+    peak_mem_decoder = math.nan
     for line in output.splitlines():
-        m = re.search(r"MEM usage: (\d+) (\d+)", line)
-        if m:
-            peak_mem_encoder = int(m[1])
-            peak_mem_decoder = int(m[2])
+        if "MEM usage:" not in line:
+            continue
+        mem_values = [int(v) for v in re.findall(r"\d+", line.split("MEM usage:", 1)[1])]
+        if mem_values:
+            peak_mem_encoder = mem_values[0]
+            peak_mem_decoder = max(mem_values[1:], default=mem_values[0])
             break
 
-    max_active_experts = 0
+    max_active_experts = math.nan
     for line in output.splitlines():
         m = re.search(r"Max active experts: (\d+)", line)
         if m:
             max_active_experts = int(m[1])
             break
 
-    cache_hit_rate = 0
+    avg_active_experts = math.nan
     for line in output.splitlines():
-        m = re.search(r"Average cache hit rate: ([\d\.]+)", line)
+        m = re.search(rf"Average active experts: ({FLOAT_RE})", line)
         if m:
-            cache_hit_rate = float(m[1])
-    
-    return block_lat, throughput, peak_mem_encoder, peak_mem_decoder, max_active_experts, cache_hit_rate
+            avg_active_experts = parse_float(m[1])
+            break
+
+    cache_hit_rate = math.nan
+    for line in output.splitlines():
+        m = re.search(rf"Average cache hit rate: ({FLOAT_RE})", line)
+        if m:
+            cache_hit_rate = parse_float(m[1])
+            break
+
+    return {
+        "block_lat": block_lat,
+        "throughput": throughput,
+        "peak_mem_encoder": peak_mem_encoder,
+        "peak_mem_decoder": peak_mem_decoder,
+        "max_active_expert": max_active_experts,
+        "avg_active_expert": avg_active_experts,
+        "cache_hit_rate": cache_hit_rate,
+    }
 
 
 def is_output_valid(output: str):
-    has_block_lat = re.search(r"BLK AVG: ([\d\.]+) ms", output) is not None
-    has_throughput = re.search(r", (\d+) tokens/sec\.", output) is not None
+    output = normalize_output(output)
+    has_block_lat = re.search(rf"BLK AVG: ({FLOAT_RE}) ms", output) is not None
+    has_throughput = re.search(rf", ({FLOAT_RE}) tokens/sec\.", output) is not None
     return has_block_lat or has_throughput
+
+
+def compute_arena_size_bytes(method, size_per_expert, total_experts, num_layer, cache_ratio):
+    if method == "GPU-only":
+        return 0, 0
+
+    if cache_ratio and cache_ratio > 0:
+        expert_slots = max(round(num_layer * total_experts * cache_ratio), 1)
+        return expert_slots * size_per_expert, 1
+
+    # With cache disabled, the arena is still used as a staging buffer for fetched experts.
+    # The original 20 GiB default is too aggressive for 24 GiB consumer GPUs.
+    if method == "Pre-gated":
+        expert_slots = 16
+    elif method == "DeepSpeed":
+        expert_slots = 8
+    elif method == "SE-MoE":
+        expert_slots = total_experts
+    else:
+        expert_slots = 1
+
+    expert_slots = max(1, min(expert_slots, total_experts))
+    return expert_slots * size_per_expert, 0
 
 
 def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, cache_ratio=0, disk_offload=0):
@@ -81,12 +142,9 @@ def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, c
 
     total_experts = int(re.search(r"\d+", model)[0])
 
-    arena_size = 21474836480
-    use_cache = 0
-    if cache_ratio != 0:
-        use_cache = 1
-        arena_size = max(round(num_layer * total_experts * cache_ratio), 1)
-        arena_size = arena_size * size_per_expert
+    arena_size, use_cache = compute_arena_size_bytes(
+        method, size_per_expert, total_experts, num_layer, cache_ratio
+    )
 
     cpp_config["default"] = {
         "arena_size": f"{arena_size}",
@@ -133,6 +191,10 @@ def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, c
         cwd="/workspace/FasterTransformer/build"
     )
 
+    combined_output = result.stdout
+    if result.stderr:
+        combined_output += ("\n" if combined_output and not combined_output.endswith("\n") else "") + result.stderr
+
     with open(f"/workspace/FasterTransformer/logs/{exp_name}.log", "w") as fp:
         fp.write("=== STDOUT ===\n")
         fp.write(result.stdout)
@@ -144,51 +206,66 @@ def profile_config(cpp_config, model, method, batch_size, forced_num_expert=0, c
         return {
             "block_lat": math.nan,
             "throughput": math.nan,
+            "peak_mem_encoder": math.nan,
+            "peak_mem_decoder": math.nan,
             "peak_mem": math.nan,
             "max_active_expert": math.nan,
+            "avg_active_expert": math.nan,
             "cache_hit_rate": math.nan,
         }
 
-    block_lat, throughput, peak_mem_encoder, peak_mem_decoder, max_active_experts, cache_hit_rate = parse_output(result.stdout)
+    parsed = parse_output(combined_output)
 
-    if not is_output_valid(result.stdout):
+    if not is_output_valid(combined_output):
         print(f"[WARN] Failed to parse benchmark output. See logs/{exp_name}.log")
         return {
             "block_lat": math.nan,
             "throughput": math.nan,
+            "peak_mem_encoder": math.nan,
+            "peak_mem_decoder": math.nan,
             "peak_mem": math.nan,
             "max_active_expert": math.nan,
+            "avg_active_expert": math.nan,
             "cache_hit_rate": math.nan,
         }
 
     peak_mem = math.nan
-    if peak_mem_decoder > 0:
-        if method == "Pre-gated":
-            used_buffer = 2 * max_active_experts
-        elif method == "DeepSpeed":
-            used_buffer = max_active_experts
-        elif method == "GPU-only":
-            used_buffer = num_layer * total_experts
-        elif method == "SE-MoE":
-            used_buffer = 2 * total_experts
-        peak_mem = peak_mem_decoder - arena_size - size_per_expert * (2 * total_experts - used_buffer)
+    if not math.isnan(parsed["peak_mem_decoder"]) and parsed["peak_mem_decoder"] > 0:
+        max_active_expert = parsed["max_active_expert"]
+        if method == "GPU-only":
+            peak_mem = parsed["peak_mem_decoder"]
+        else:
+            if method == "Pre-gated":
+                used_buffer = 2 * max_active_expert if not math.isnan(max_active_expert) else math.nan
+            elif method == "DeepSpeed":
+                used_buffer = max_active_expert
+            elif method == "SE-MoE":
+                used_buffer = 2 * total_experts
+            else:
+                used_buffer = math.nan
+            if not math.isnan(used_buffer):
+                peak_mem = parsed["peak_mem_decoder"] - arena_size - size_per_expert * (2 * total_experts - used_buffer)
 
     print(
-        f"BLK AVG: {block_lat} ms, "
-        f"throughput: {throughput} tokens/sec, "
-        f"peak_mem_encoder: {peak_mem_encoder}, "
-        f"peak_mem_decoder: {peak_mem_decoder}, "
-        f"max_active_experts: {max_active_experts}, "
+        f"BLK AVG: {parsed['block_lat']} ms, "
+        f"throughput: {parsed['throughput']} tokens/sec, "
+        f"peak_mem_encoder: {parsed['peak_mem_encoder']}, "
+        f"peak_mem_decoder: {parsed['peak_mem_decoder']}, "
+        f"max_active_experts: {parsed['max_active_expert']}, "
+        f"avg_active_experts: {parsed['avg_active_expert']}, "
         f"peak_mem: {peak_mem}, "
-        f"cache_hit_rate: {cache_hit_rate}"
+        f"cache_hit_rate: {parsed['cache_hit_rate']}"
     )
 
     return {
-        "block_lat": block_lat,
-        "throughput": throughput,
+        "block_lat": parsed["block_lat"],
+        "throughput": parsed["throughput"],
+        "peak_mem_encoder": parsed["peak_mem_encoder"],
+        "peak_mem_decoder": parsed["peak_mem_decoder"],
         "peak_mem": peak_mem,
-        "max_active_expert": max_active_experts,
-        "cache_hit_rate": cache_hit_rate,
+        "max_active_expert": parsed["max_active_expert"],
+        "avg_active_expert": parsed["avg_active_expert"],
+        "cache_hit_rate": parsed["cache_hit_rate"],
     }
 
 
@@ -225,9 +302,12 @@ def main():
     metrics = [
         "block_lat",
         "throughput",
+        "peak_mem_encoder",
+        "peak_mem_decoder",
         "peak_mem",
-        # "max_active_expert",
-        # "cache_hit_rate",
+        "max_active_expert",
+        "avg_active_expert",
+        "cache_hit_rate",
     ]
     forced_num_experts = [
         0,
