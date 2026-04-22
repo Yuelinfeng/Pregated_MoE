@@ -65,6 +65,7 @@ void FetcherContext<ActT, WeightT, BiasT>::fetch(const int* permuted_experts, bo
 {
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
     const bool skip_prefetch_transfer = last_time && prefetch;
+    const int64_t prefetch_issue_id = (prefetch && !skip_prefetch_transfer) ? ++next_prefetch_issue_id_ : -1;
     if (skip_prefetch_transfer) {
         FT_LOG_TRACE("Skip weight transfer for the final prefetched layer");
     }
@@ -95,7 +96,8 @@ void FetcherContext<ActT, WeightT, BiasT>::fetch(const int* permuted_experts, bo
                                                      static_cast<int>(num_experts_),
                                                      first_time,
                                                      last_time,
-                                                     prefetch && !skip_prefetch_transfer);
+                                                     prefetch && !skip_prefetch_transfer,
+                                                     prefetch_issue_id);
 
     if (GlobalConfig::instance().profiling) {
         Profiling::instance().activeExperts(num_active_experts_);
@@ -125,20 +127,40 @@ void FetcherContext<ActT, WeightT, BiasT>::fetch(const int* permuted_experts, bo
         std::string layer_name = prefetch ? next_layer_name_ : current_layer_name_;
 
         if (scales_required) {
-            futures_.push_back(GroupedMemoryArena::instance().allocate(
-                layer_name + "expert" + std::to_string(expert), {
-                    reinterpret_cast<char*>(intermediate_working_) + i * intermediate_w_size_per_expert_,
-                    reinterpret_cast<char*>(output_working_) + i * output_w_size_per_expert_,
-                    reinterpret_cast<char*>(intermediate_scale_working_) + i * intermediate_scale_size_per_expert_,
-                    reinterpret_cast<char*>(output_scale_working_) + i * output_scale_size_per_expert_},
-                fetch_weight_src + expert * weight_size_per_expert_));
+            transfer_tasks_.push_back(TransferTask{
+                GroupedMemoryArena::instance().allocate(
+                    layer_name + "expert" + std::to_string(expert),
+                    {
+                        reinterpret_cast<char*>(intermediate_working_) + i * intermediate_w_size_per_expert_,
+                        reinterpret_cast<char*>(output_working_) + i * output_w_size_per_expert_,
+                        reinterpret_cast<char*>(intermediate_scale_working_) + i * intermediate_scale_size_per_expert_,
+                        reinterpret_cast<char*>(output_scale_working_) + i * output_scale_size_per_expert_,
+                    },
+                    fetch_weight_src + expert * weight_size_per_expert_,
+                    prefetch && PrefetchTraceLogger::instance().enabled()),
+                expert,
+                current_layer_name_,
+                next_layer_name_,
+                prefetch_issue_id,
+                prefetch,
+            });
         }
         else {
-            futures_.push_back(GroupedMemoryArena::instance().allocate(
-                layer_name + "expert" + std::to_string(expert), {
-                    reinterpret_cast<char*>(intermediate_working_) + i * intermediate_w_size_per_expert_,
-                    reinterpret_cast<char*>(output_working_) + i * output_w_size_per_expert_},
-                fetch_weight_src + expert * weight_size_per_expert_));
+            transfer_tasks_.push_back(TransferTask{
+                GroupedMemoryArena::instance().allocate(
+                    layer_name + "expert" + std::to_string(expert),
+                    {
+                        reinterpret_cast<char*>(intermediate_working_) + i * intermediate_w_size_per_expert_,
+                        reinterpret_cast<char*>(output_working_) + i * output_w_size_per_expert_,
+                    },
+                    fetch_weight_src + expert * weight_size_per_expert_,
+                    prefetch && PrefetchTraceLogger::instance().enabled()),
+                expert,
+                current_layer_name_,
+                next_layer_name_,
+                prefetch_issue_id,
+                prefetch,
+            });
         }
     }
 }
@@ -149,14 +171,51 @@ template<class ActT, class WeightT, class BiasT>
 void FetcherContext<ActT, WeightT, BiasT>::sync()
 {
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
-    for (auto& future : futures_) {
-        future.wait();
+    auto sync_start = std::chrono::steady_clock::now();
+    for (auto& transfer_task : transfer_tasks_) {
+        transfer_task.allocation.future.wait();
+    }
+
+    std::vector<bool> ready_before_consume;
+    ready_before_consume.reserve(transfer_tasks_.size());
+    for (auto& transfer_task : transfer_tasks_) {
+        bool ready = true;
+        if (transfer_task.is_prefetch && transfer_task.allocation.completion_event != nullptr) {
+            const cudaError_t status = cudaEventQuery(transfer_task.allocation.completion_event);
+            if (status == cudaSuccess) {
+                ready = true;
+            }
+            else if (status == cudaErrorNotReady) {
+                ready = false;
+            }
+            else {
+                check_cuda_error(status);
+            }
+        }
+        ready_before_consume.push_back(ready);
     }
     if (GlobalConfig::instance().profiling) {
         Profiling::instance().insert(stream, EventType::MEM_END);
     }
-    futures_.clear();
     check_cuda_error(cudaStreamSynchronize(stream));
+
+    const double stall_time_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync_start).count();
+
+    for (size_t idx = 0; idx < transfer_tasks_.size(); ++idx) {
+        const auto& transfer_task = transfer_tasks_[idx];
+        if (!transfer_task.is_prefetch) {
+            continue;
+        }
+        PrefetchTraceLogger::instance().recordPrefetchExpertEvent(transfer_task.source_layer,
+                                                                  transfer_task.target_layer,
+                                                                  transfer_task.prefetch_issue_id,
+                                                                  transfer_task.expert_id,
+                                                                  transfer_task.allocation.cache_hit,
+                                                                  ready_before_consume[idx],
+                                                                  stall_time_ms);
+    }
+    transfer_tasks_.clear();
 
     // update dst from working (swap them)
     std::swap(intermediate_dst_, intermediate_working_);
@@ -212,7 +271,7 @@ int64_t expert_for_row_backup_time = 0; // microseconds
 template<class ActT, class WeightT, class BiasT> 
 FetcherContext<ActT, WeightT, BiasT>::~FetcherContext() {
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
-    FT_LOG_TRACE("futures left: %d", futures_.size());
+    FT_LOG_TRACE("transfer tasks left: %d", transfer_tasks_.size());
     freeBuffer();
     check_cuda_error(cudaStreamDestroy(stream));
 }
@@ -260,33 +319,44 @@ template<class ActT, class WeightT, class BiasT>
 void FetcherContext<ActT, WeightT, BiasT>::allocateBuffer(IAllocator* allocator, size_t num_rows)
 {
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
-    if (is_allocate_buffer_) {
-        return;
-    }
-
     allocator_ = allocator;
     num_rows_ = num_rows;
 
-    // TODO: refactor with reMalloc
-    intermediate_dst_ = (WeightT*)allocator_->reMalloc(intermediate_dst_, intermediate_w_size_per_expert_ * num_experts_);
-    output_dst_ = (WeightT*)allocator_->reMalloc(output_dst_, output_w_size_per_expert_ * num_experts_);
-    intermediate_bias_dst_ = (BiasT*)allocator_->reMalloc(intermediate_bias_dst_, intermediate_b_size_per_expert_ * num_experts_);
-    intermediate_working_ = (WeightT*)allocator_->reMalloc(intermediate_working_, intermediate_w_size_per_expert_ * num_experts_);
-    output_working_ = (WeightT*)allocator_->reMalloc(output_working_, output_w_size_per_expert_ * num_experts_);
-    intermediate_bias_working_ = (BiasT*)allocator_->reMalloc(intermediate_bias_working_, intermediate_b_size_per_expert_ * num_experts_);
-    if (scales_required) {
-        intermediate_scale_dst_ = (ActT*)allocator_->reMalloc(intermediate_scale_dst_, intermediate_scale_size_per_expert_ * num_experts_);
-        output_scale_dst_ = (ActT*)allocator_->reMalloc(output_scale_dst_, output_scale_size_per_expert_ * num_experts_);
-        intermediate_scale_working_ = (ActT*)allocator_->reMalloc(intermediate_scale_working_, intermediate_scale_size_per_expert_ * num_experts_);
-        output_scale_working_ = (ActT*)allocator_->reMalloc(output_scale_working_, output_scale_size_per_expert_ * num_experts_);
+    if (!is_allocate_buffer_) {
+        // Expert-weight buffers are sized by num_experts_ and can be reused across requests.
+        intermediate_dst_ = (WeightT*)allocator_->reMalloc(intermediate_dst_, intermediate_w_size_per_expert_ * num_experts_);
+        output_dst_ = (WeightT*)allocator_->reMalloc(output_dst_, output_w_size_per_expert_ * num_experts_);
+        intermediate_bias_dst_ =
+            (BiasT*)allocator_->reMalloc(intermediate_bias_dst_, intermediate_b_size_per_expert_ * num_experts_);
+        intermediate_working_ =
+            (WeightT*)allocator_->reMalloc(intermediate_working_, intermediate_w_size_per_expert_ * num_experts_);
+        output_working_ = (WeightT*)allocator_->reMalloc(output_working_, output_w_size_per_expert_ * num_experts_);
+        intermediate_bias_working_ =
+            (BiasT*)allocator_->reMalloc(intermediate_bias_working_, intermediate_b_size_per_expert_ * num_experts_);
+        if (scales_required) {
+            intermediate_scale_dst_ =
+                (ActT*)allocator_->reMalloc(intermediate_scale_dst_, intermediate_scale_size_per_expert_ * num_experts_);
+            output_scale_dst_ =
+                (ActT*)allocator_->reMalloc(output_scale_dst_, output_scale_size_per_expert_ * num_experts_);
+            intermediate_scale_working_ = (ActT*)allocator_->reMalloc(
+                intermediate_scale_working_, intermediate_scale_size_per_expert_ * num_experts_);
+            output_scale_working_ =
+                (ActT*)allocator_->reMalloc(output_scale_working_, output_scale_size_per_expert_ * num_experts_);
+        }
+
+        is_allocate_buffer_ = true;
+
+        if (GlobalConfig::instance().profiling) {
+            Profiling::instance().recordMemoryUsage();
+        }
     }
 
-    permuted_experts_ = (int*)allocator_->reMalloc(permuted_experts_, sizeof(int) * num_rows, false, true);
-
-    is_allocate_buffer_ = true;
-
-    if (GlobalConfig::instance().profiling) {
-        Profiling::instance().recordMemoryUsage();
+    // Request lengths vary across prompts. Track the current row count separately from
+    // the backing host-buffer capacity so later, longer requests can grow safely, while
+    // shorter requests still copy only their live rows.
+    if (num_rows_capacity_ < num_rows_) {
+        permuted_experts_ = (int*)allocator_->reMalloc(permuted_experts_, sizeof(int) * num_rows_, false, true);
+        num_rows_capacity_ = num_rows_;
     }
 }
 
@@ -313,6 +383,8 @@ void FetcherContext<ActT, WeightT, BiasT>::freeBuffer()
         allocator_->free((void**)&permuted_experts_, true);
 
         is_allocate_buffer_ = false;
+        num_rows_ = 0;
+        num_rows_capacity_ = 0;
     }
 }
 

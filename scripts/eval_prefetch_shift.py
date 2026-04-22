@@ -708,6 +708,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forced_num_experts", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--write_trace_only", action="store_true")
+    parser.add_argument("--disable_hard_exit_on_success", action="store_true")
     return parser.parse_args()
 
 
@@ -747,30 +748,41 @@ def main() -> None:
     if run_status_path.exists():
         run_status_path.unlink()
 
-    translation_prompts = load_translation_prompts(args.translation_source, args.num_requests * 2)
-    summarization_prompts: List[str] = []
-    if needs_summarization_prompts(args):
-        summarization_prompts = load_summarization_prompts(args.num_requests * 2, args.summarization_cache_dir)
-
-    if not translation_prompts or (needs_summarization_prompts(args) and not summarization_prompts):
-        raise RuntimeError("Failed to load enough prompts for the requested trace.")
-
-    requests = build_trace(args, translation_prompts, summarization_prompts)
-    write_trace_manifest(args.output_dir / "request_trace.jsonl", requests)
-    write_workload_summary(args.output_dir / "workload_summary.json", requests)
-
     run_status = {
         "trace_id": args.trace_id,
         "condition": args.condition,
         "method": args.method,
         "cache_ratio": args.cache_ratio,
         "seed": args.seed,
-        "expected_num_requests": len(requests),
+        "expected_num_requests": args.num_requests,
         "completed_num_requests": 0,
-        "status": "trace_ready",
+        "status": "initializing",
         "started_at_utc": utc_timestamp(),
     }
     write_json(run_status_path, run_status)
+
+    try:
+        translation_prompts = load_translation_prompts(args.translation_source, args.num_requests * 2)
+        summarization_prompts: List[str] = []
+        if needs_summarization_prompts(args):
+            summarization_prompts = load_summarization_prompts(args.num_requests * 2, args.summarization_cache_dir)
+
+        if not translation_prompts or (needs_summarization_prompts(args) and not summarization_prompts):
+            raise RuntimeError("Failed to load enough prompts for the requested trace.")
+
+        requests = build_trace(args, translation_prompts, summarization_prompts)
+        write_trace_manifest(args.output_dir / "request_trace.jsonl", requests)
+        write_workload_summary(args.output_dir / "workload_summary.json", requests)
+
+        run_status["expected_num_requests"] = len(requests)
+        run_status["status"] = "trace_ready"
+        write_json(run_status_path, run_status)
+    except Exception as exc:
+        run_status["status"] = "failed_before_execution"
+        run_status["completed_at_utc"] = utc_timestamp()
+        run_status["error"] = repr(exc)
+        write_json(run_status_path, run_status)
+        raise
 
     if args.write_trace_only:
         run_status["completed_num_requests"] = len(requests)
@@ -789,6 +801,10 @@ def main() -> None:
         run_status["status"] = "complete"
         run_status["completed_at_utc"] = utc_timestamp()
         write_json(run_status_path, run_status)
+        if not args.disable_hard_exit_on_success:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
     except Exception as exc:
         run_status["status"] = "failed"
         run_status["completed_num_requests"] = sum(

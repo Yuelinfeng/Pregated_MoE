@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
@@ -27,13 +28,14 @@ public:
         return trace_path != nullptr && trace_path[0] != '\0';
     }
 
-    void recordLayerEvent(const std::string&               current_layer_name,
-                          const std::string&               next_layer_name,
+    void recordLayerEvent(const std::string&                    current_layer_name,
+                          const std::string&                    next_layer_name,
                           const std::vector<std::pair<int, int>>& actual_counts,
-                          int                              num_experts,
-                          bool                             is_first_moe,
-                          bool                             is_last_moe,
-                          bool                             store_prediction)
+                          int                                   num_experts,
+                          bool                                  is_first_moe,
+                          bool                                  is_last_moe,
+                          bool                                  store_prediction,
+                          int64_t                               prefetch_issue_id = -1)
     {
         if (!enabled() || !startsWith(current_layer_name, "decoder::")) {
             return;
@@ -69,7 +71,8 @@ public:
                                      current_layer_name,
                                      pred_it->second.predicted_experts,
                                      actual_counts,
-                                     num_experts);
+                                     num_experts,
+                                     pred_it->second.prefetch_issue_id);
                 pending_predictions_.erase(pred_it);
             }
 
@@ -84,12 +87,18 @@ public:
                             -1,
                             -1,
                             -1,
-                            -1);
+                            -1,
+                            -1,
+                            -1,
+                            -1,
+                            -1,
+                            -1.0);
             seen_actual_layers_.insert(current_layer_name);
         }
 
         if (store_prediction && !is_last_moe && !next_layer_name.empty()) {
-            pending_predictions_[next_layer_name] = PendingPrediction{current_layer_name, actual_experts};
+            pending_predictions_[next_layer_name] =
+                PendingPrediction{current_layer_name, actual_experts, prefetch_issue_id};
             writeLineLocked("PREDICTION",
                             meta,
                             current_layer_name,
@@ -101,7 +110,12 @@ public:
                             -1,
                             -1,
                             -1,
-                            -1);
+                            -1,
+                            prefetch_issue_id,
+                            -1,
+                            -1,
+                            -1,
+                            -1.0);
         }
 
         if (is_last_moe) {
@@ -142,8 +156,49 @@ public:
                 << '\t' << -1
                 << '\t' << -1
                 << '\t' << -1
+                << '\t' << -1
+                << '\t' << -1
+                << '\t' << -1
+                << '\t' << -1
+                << '\t' << -1.0
                 << '\n';
         stream_.flush();
+    }
+
+    void recordPrefetchExpertEvent(const std::string& source_layer,
+                                   const std::string& target_layer,
+                                   int64_t            prefetch_issue_id,
+                                   int                expert_id,
+                                   bool               cache_hit,
+                                   bool               ready_before_consume,
+                                   double             stall_time_ms)
+    {
+        if (!enabled() || !startsWith(source_layer, "decoder::")) {
+            return;
+        }
+
+        const Metadata meta = readMetadata();
+        std::lock_guard<std::mutex> guard(mutex_);
+        ensureOpenLocked();
+        resetRequestStateLocked(meta.request_id);
+
+        writeLineLocked("PREFETCH_EXPERT",
+                        meta,
+                        source_layer,
+                        target_layer,
+                        -1,
+                        "",
+                        "",
+                        "",
+                        -1,
+                        -1,
+                        -1,
+                        -1,
+                        prefetch_issue_id,
+                        expert_id,
+                        cache_hit ? 1 : 0,
+                        ready_before_consume ? 1 : 0,
+                        stall_time_ms);
     }
 
 private:
@@ -155,8 +210,9 @@ private:
     };
 
     struct PendingPrediction {
-        std::string    source_layer;
+        std::string     source_layer;
         std::vector<int> predicted_experts;
+        int64_t         prefetch_issue_id = -1;
     };
 
     PrefetchTraceLogger() = default;
@@ -250,7 +306,8 @@ private:
                 return;
             }
             stream_ << "event_type\ttrace_id\tcondition\trequest_id\tdomain\tstep_id\tsource_layer\ttarget_layer"
-                    << "\tnum_experts\tpredicted_experts\tactual_experts\tactual_counts\ttp\tfp\tfn\ttn\n";
+                    << "\tnum_experts\tpredicted_experts\tactual_experts\tactual_counts\ttp\tfp\tfn\ttn"
+                    << "\tprefetch_issue_id\texpert_id\tcache_hit\tready_before_consume\tstall_time_ms\n";
             header_written_ = true;
             stream_.flush();
         }
@@ -268,12 +325,13 @@ private:
         pending_predictions_.clear();
     }
 
-    void writeConfusionLocked(const Metadata&                    meta,
-                              const std::string&                 source_layer,
-                              const std::string&                 target_layer,
-                              const std::vector<int>&            predicted_experts,
+    void writeConfusionLocked(const Metadata&                     meta,
+                              const std::string&                  source_layer,
+                              const std::string&                  target_layer,
+                              const std::vector<int>&             predicted_experts,
                               const std::vector<std::pair<int, int>>& actual_counts,
-                              int                                num_experts)
+                              int                                 num_experts,
+                              int64_t                             prefetch_issue_id)
     {
         std::unordered_set<int> predicted(predicted_experts.begin(), predicted_experts.end());
         std::vector<int>        actual_experts = flattenExperts(actual_counts);
@@ -308,21 +366,31 @@ private:
                         tp,
                         fp,
                         fn,
-                        tn);
+                        tn,
+                        prefetch_issue_id,
+                        -1,
+                        -1,
+                        -1,
+                        -1.0);
     }
 
-    void writeLineLocked(const char*         event_type,
-                         const Metadata&     meta,
-                         const std::string&  source_layer,
-                         const std::string&  target_layer,
-                         int                 num_experts,
-                         const std::string&  predicted_experts,
-                         const std::string&  actual_experts,
-                         const std::string&  actual_counts,
-                         int                 tp,
-                         int                 fp,
-                         int                 fn,
-                         int                 tn)
+    void writeLineLocked(const char*        event_type,
+                         const Metadata&    meta,
+                         const std::string& source_layer,
+                         const std::string& target_layer,
+                         int                num_experts,
+                         const std::string& predicted_experts,
+                         const std::string& actual_experts,
+                         const std::string& actual_counts,
+                         int                tp,
+                         int                fp,
+                         int                fn,
+                         int                tn,
+                         int64_t            prefetch_issue_id,
+                         int                expert_id,
+                         int                cache_hit,
+                         int                ready_before_consume,
+                         double             stall_time_ms)
     {
         if (!stream_.is_open()) {
             return;
@@ -344,18 +412,23 @@ private:
                 << '\t' << fp
                 << '\t' << fn
                 << '\t' << tn
+                << '\t' << prefetch_issue_id
+                << '\t' << expert_id
+                << '\t' << cache_hit
+                << '\t' << ready_before_consume
+                << '\t' << stall_time_ms
                 << '\n';
         stream_.flush();
     }
 
-    std::mutex                                mutex_;
-    std::ofstream                             stream_;
-    std::string                               open_path_;
-    bool                                      header_written_ = false;
-    std::string                               current_request_id_;
-    int                                       current_step_ = -1;
-    bool                                      step_open_ = false;
-    std::unordered_set<std::string>           seen_actual_layers_;
+    std::mutex                                      mutex_;
+    std::ofstream                                   stream_;
+    std::string                                     open_path_;
+    bool                                            header_written_ = false;
+    std::string                                     current_request_id_;
+    int                                             current_step_ = -1;
+    bool                                            step_open_ = false;
+    std::unordered_set<std::string>                 seen_actual_layers_;
     std::unordered_map<std::string, PendingPrediction> pending_predictions_;
 };
 

@@ -16,8 +16,8 @@ namespace fastertransformer {
 template class MemoryArena<char>;
 
 template <typename T>
-MemoryArena<T>::MemoryArena(size_t size, size_t chunk_size, cudaStream_t stream) 
-    : chunk_size_(chunk_size), 
+MemoryArena<T>::MemoryArena(size_t size, size_t chunk_size, cudaStream_t stream)
+    : chunk_size_(chunk_size),
       size_(size),
       chunk_num_(0),
       ptr_(nullptr),
@@ -55,12 +55,19 @@ MemoryArena<T>::MemoryArena(size_t size, size_t chunk_size, cudaStream_t stream)
 }
 
 template <typename T>
-std::future<void> MemoryArena<T>::allocate(const tag_t& tag, T* dst, const T* src,
-                                           std::function<void(const T*, cudaStream_t)> post_callback)
+ArenaAllocation MemoryArena<T>::allocate(const tag_t& tag,
+                                         T*           dst,
+                                         const T*     src,
+                                         std::function<void(const T*, cudaStream_t)> post_callback,
+                                         bool         record_completion_event)
 {
     auto repl = cache_->GetOrPut(tag, nullptr);
     if (GlobalConfig::instance().profiling) {
         Profiling::instance().cacheHit(repl.second);
+    }
+    cudaEvent_t completion_event = nullptr;
+    if (record_completion_event) {
+        check_cuda_error(cudaEventCreateWithFlags(&completion_event, cudaEventDisableTiming));
     }
     auto future = pool_->push([=](int) {
         if (!GlobalConfig::instance().use_cache  // if not use_cache, do this anyway
@@ -83,8 +90,11 @@ std::future<void> MemoryArena<T>::allocate(const tag_t& tag, T* dst, const T* sr
         } else {
             post_callback(repl.first, stream_);
         }
+        if (completion_event != nullptr) {
+            check_cuda_error(cudaEventRecord(completion_event, stream_));
+        }
     });
-    return future;
+    return ArenaAllocation(std::move(future), repl.second, completion_event);
 }
 
 } // namespace fastertransformer

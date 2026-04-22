@@ -3,6 +3,7 @@ import json
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
@@ -12,6 +13,15 @@ MAIN_CONDITIONS = [
     "shifted_homogeneous",
     "stable_mixed",
     "shifted_mixed",
+]
+
+ABLATION_CONDITIONS = [
+    "stable_mixed_ab",
+    "stable_mixed_ba",
+    "stable_mixed_balanced_order",
+    "shifted_mixed_ratio_only",
+    "shifted_mixed_order_only",
+    "shifted_mixed_ratio_and_order",
 ]
 
 METHODS = ["on_demand", "prefetch"]
@@ -26,12 +36,81 @@ def run_command(command: List[str], log_path: Path, cwd: Path) -> None:
         log_file.flush()
         process = subprocess.run(command, cwd=str(cwd), stdout=log_file, stderr=subprocess.STDOUT, text=True)
     if process.returncode != 0:
-        raise RuntimeError(f"Command failed with exit code {process.returncode}: {' '.join(command)}")
+        tail_lines = []
+        with log_path.open("r", encoding="utf-8") as log_file:
+            tail_lines = log_file.readlines()[-80:]
+        tail_text = "".join(tail_lines).strip()
+        raise RuntimeError(
+            f"Command failed with exit code {process.returncode}: {' '.join(command)}\n"
+            f"--- log tail ({log_path}) ---\n{tail_text}"
+        )
 
 
 def count_nonempty_lines(path: Path) -> int:
     with path.open("r", encoding="utf-8") as handle:
         return sum(1 for line in handle if line.strip())
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def salvage_complete_cell(
+    cell_dir: Path,
+    *,
+    expected_num_requests: int,
+    method: str,
+    condition: str,
+    cache_ratio: str,
+    seed: int,
+) -> bool:
+    request_trace_path = cell_dir / "request_trace.jsonl"
+    workload_summary_path = cell_dir / "workload_summary.json"
+    request_metrics_path = cell_dir / "request_metrics.jsonl"
+    request_metrics_partial_path = cell_dir / "request_metrics.jsonl.partial"
+    run_status_path = cell_dir / "run_status.json"
+
+    if request_metrics_partial_path.is_file() and count_nonempty_lines(request_metrics_partial_path) == expected_num_requests:
+        if request_metrics_path.exists():
+            request_metrics_path.unlink()
+        request_metrics_partial_path.replace(request_metrics_path)
+
+    required_inputs_present = request_trace_path.is_file() and workload_summary_path.is_file() and request_metrics_path.is_file()
+    if not required_inputs_present:
+        return False
+
+    if count_nonempty_lines(request_trace_path) != expected_num_requests:
+        return False
+    if count_nonempty_lines(request_metrics_path) != expected_num_requests:
+        return False
+
+    run_status = {}
+    if run_status_path.is_file():
+        with run_status_path.open("r", encoding="utf-8") as handle:
+            run_status = json.load(handle)
+
+    run_status.update(
+        {
+            "condition": condition,
+            "method": method,
+            "cache_ratio": float(cache_ratio),
+            "seed": seed,
+            "expected_num_requests": expected_num_requests,
+            "completed_num_requests": expected_num_requests,
+            "status": "complete",
+            "completed_at_utc": utc_timestamp(),
+            "salvaged_after_nonzero_exit": True,
+        }
+    )
+    if "started_at_utc" not in run_status:
+        run_status["started_at_utc"] = utc_timestamp()
+    if "trace_id" not in run_status:
+        run_status["trace_id"] = f"{condition}_cr{cache_ratio}_{method}_seed{seed}"
+
+    with run_status_path.open("w", encoding="utf-8") as handle:
+        json.dump(run_status, handle, ensure_ascii=False, indent=2)
+
+    return cell_complete(cell_dir, expected_num_requests, method)
 
 
 def cell_complete(cell_dir: Path, expected_num_requests: int, method: str) -> bool:
@@ -94,9 +173,16 @@ def main() -> None:
     python_exe = sys.executable
     repo_root = args.repo_root.resolve()
     args.results_root.mkdir(parents=True, exist_ok=True)
+    selected_methods = list(dict.fromkeys(args.methods))
+    selected_conditions = list(dict.fromkeys(args.conditions))
+    has_on_demand = "on_demand" in selected_methods
+    has_prefetch = "prefetch" in selected_methods
+    has_comparable_methods = has_on_demand and has_prefetch
+    is_main_2x2_run = set(selected_conditions).issubset(set(MAIN_CONDITIONS))
+    has_ablation_conditions = any(condition in ABLATION_CONDITIONS for condition in selected_conditions)
 
-    for method in args.methods:
-        for condition in args.conditions:
+    for method in selected_methods:
+        for condition in selected_conditions:
             for cache_ratio in args.cache_ratios:
                 cell_dir = args.results_root / method / condition / f"cr{cache_ratio}"
                 if not args.force_rerun and cell_complete(cell_dir, args.num_requests, method):
@@ -143,22 +229,45 @@ def main() -> None:
                         "--seed", str(args.seed),
                     ]
 
+                    trace_failed = False
                     try:
                         run_command(trace_command, cell_dir / f"run_attempt{attempt}.log", repo_root)
-                        if method == "prefetch":
-                            analyze_command = [
-                                python_exe,
-                                str(repo_root / "scripts" / "analyze_prefetch_confusion.py"),
-                                "--trace_path", str(cell_dir / "prefetch_trace.tsv"),
-                                "--request_metrics_path", str(cell_dir / "request_metrics.jsonl"),
-                                "--boundary_window", "8",
-                                "--output_csv", str(cell_dir / "confusion_boundary8.csv"),
-                                "--output_json", str(cell_dir / "confusion_boundary8.json"),
-                            ]
-                            run_command(analyze_command, cell_dir / f"analyze_attempt{attempt}.log", repo_root)
                     except Exception as exc:
-                        print(f"[warn] attempt {attempt} failed for {method} {condition} cr{cache_ratio}: {exc}")
-                        continue
+                        trace_failed = True
+                        salvaged = salvage_complete_cell(
+                            cell_dir,
+                            expected_num_requests=args.num_requests,
+                            method=method,
+                            condition=condition,
+                            cache_ratio=str(cache_ratio),
+                            seed=args.seed,
+                        )
+                        if salvaged:
+                            print(
+                                f"[salvaged] completed outputs recovered after nonzero exit for "
+                                f"{method} {condition} cr{cache_ratio}"
+                            )
+                        else:
+                            print(f"[warn] attempt {attempt} failed for {method} {condition} cr{cache_ratio}: {exc}")
+                            continue
+
+                    if method == "prefetch" and not (cell_dir / "confusion_boundary8.csv").is_file():
+                        analyze_command = [
+                            python_exe,
+                            str(repo_root / "scripts" / "analyze_prefetch_confusion.py"),
+                            "--trace_path", str(cell_dir / "prefetch_trace.tsv"),
+                            "--request_metrics_path", str(cell_dir / "request_metrics.jsonl"),
+                            "--boundary_window", "8",
+                            "--output_csv", str(cell_dir / "confusion_boundary8.csv"),
+                            "--output_json", str(cell_dir / "confusion_boundary8.json"),
+                        ]
+                        try:
+                            run_command(analyze_command, cell_dir / f"analyze_attempt{attempt}.log", repo_root)
+                        except Exception as exc:
+                            print(
+                                f"[warn] confusion analysis failed for {method} {condition} cr{cache_ratio}: {exc}"
+                            )
+                            continue
 
                     if cell_complete(cell_dir, args.num_requests, method):
                         success = True
@@ -172,18 +281,30 @@ def main() -> None:
         str(repo_root / "scripts" / "validate_prefetch_shift_results.py"),
         "--results_root", str(args.results_root),
         "--expected_num_requests", str(args.num_requests),
-        "--conditions", *args.conditions,
+        "--conditions", *selected_conditions,
         "--methods", *args.methods,
         "--cache_ratios", *args.cache_ratios,
     ]
     run_command(validate_command, args.results_root / "validate.log", repo_root)
+
+    if not has_comparable_methods:
+        print(
+            "[skip] build_prefetch_shift_latency_compare.py requires both "
+            "'on_demand' and 'prefetch' methods."
+        )
+        print(
+            "[skip] analyze_prefetch_mechanisms.py and plotting also require "
+            "prefetch/on-demand comparison outputs."
+        )
+        print(f"Completed formal run at {args.results_root}")
+        return
 
     latency_command = [
         python_exe,
         str(repo_root / "scripts" / "build_prefetch_shift_latency_compare.py"),
         "--results_root", str(args.results_root),
         "--expected_num_requests", str(args.num_requests),
-        "--conditions", *args.conditions,
+        "--conditions", *selected_conditions,
         "--cache_ratios", *args.cache_ratios,
     ]
     run_command(latency_command, args.results_root / "build_latency_compare.log", repo_root)
@@ -197,21 +318,48 @@ def main() -> None:
     ]
     run_command(mechanism_command, args.results_root / "formal_analysis.log", repo_root)
 
+    if has_ablation_conditions:
+        ablation_command = [
+            python_exe,
+            str(repo_root / "scripts" / "analyze_ratio_order_ablation.py"),
+            "--results_root", str(args.results_root),
+        ]
+        run_command(ablation_command, args.results_root / "ablation_analysis.log", repo_root)
+
     if not args.skip_plots:
-        plot_final_command = [
-            python_exe,
-            str(repo_root / "scripts" / "plot_prefetch_shift_final_figure.py"),
-            "--results_root", str(args.results_root),
-            "--output_dir", str(args.results_root / "figures"),
-        ]
-        plot_results_command = [
-            python_exe,
-            str(repo_root / "scripts" / "plot_prefetch_shift_results.py"),
-            "--results_root", str(args.results_root),
-            "--output_dir", str(args.results_root / "figures"),
-        ]
-        run_command(plot_final_command, args.results_root / "plot_final.log", repo_root)
-        run_command(plot_results_command, args.results_root / "plot_results.log", repo_root)
+        if is_main_2x2_run:
+            plot_final_command = [
+                python_exe,
+                str(repo_root / "scripts" / "plot_prefetch_shift_final_figure.py"),
+                "--results_root", str(args.results_root),
+                "--output_dir", str(args.results_root / "figures"),
+            ]
+            plot_results_command = [
+                python_exe,
+                str(repo_root / "scripts" / "plot_prefetch_shift_results.py"),
+                "--results_root", str(args.results_root),
+                "--output_dir", str(args.results_root / "figures"),
+            ]
+            run_command(plot_final_command, args.results_root / "plot_final.log", repo_root)
+            run_command(plot_results_command, args.results_root / "plot_results.log", repo_root)
+        else:
+            if has_ablation_conditions:
+                ablation_plot_command = [
+                    python_exe,
+                    str(repo_root / "scripts" / "plot_ratio_order_ablation_summary.py"),
+                    "--results_root", str(args.results_root),
+                    "--output_dir", str(args.results_root / "figures"),
+                ]
+                run_command(ablation_plot_command, args.results_root / "plot_ablation.log", repo_root)
+            print(
+                "[skip] main 2x2 plotting is only defined for "
+                f"{MAIN_CONDITIONS}; current conditions are {selected_conditions}."
+            )
+            if has_ablation_conditions:
+                print(
+                    "[done] ratio/order ablation summary CSVs and single-figure plot are in "
+                    f"{args.results_root / 'ablation_analysis'} and {args.results_root / 'figures'}."
+                )
 
     print(f"Completed formal run at {args.results_root}")
 

@@ -39,6 +39,24 @@ export LD_LIBRARY_PATH=$BUILD/lib:$LD_LIBRARY_PATH
 pip install -U pandas seaborn matplotlib datasets "pyarrow<21"
 ```
 
+## 1.5 Rebuild native library after the fetcher fix
+
+The formal runner and validation scripts are pure Python, but the crash observed at
+`fetcher.cc:217` comes from the native FasterTransformer library. After updating
+`src/fastertransformer/utils/fetcher.h` and `src/fastertransformer/utils/fetcher.cc`,
+rebuild `libth_transformer.so` before rerunning the experiment.
+
+```bash
+cd /root/autodl-tmp/Pregated_MoE
+
+cmake --build build -j"$(nproc)"
+
+ls -lh /root/autodl-tmp/Pregated_MoE/build/lib/libth_transformer.so
+```
+
+If your AutoDL setup uses a separate build directory, rerun the same CMake configure
+command you used originally and then rebuild.
+
 ## 2. Main 2x2 formal run
 
 ```bash
@@ -140,6 +158,26 @@ python scripts/run_prefetch_shift_formal.py \
   --seed 0 \
   --max_retries 3
 ```
+
+After the ablation run completes, build the matched-effect summary:
+
+```bash
+python scripts/analyze_ratio_order_ablation.py \
+  --results_root /root/autodl-tmp/pregated_formal_runs/ratio_order_ablation_seed0
+```
+
+This writes:
+
+```text
+/root/autodl-tmp/pregated_formal_runs/ratio_order_ablation_seed0/ablation_analysis/ratio_order_ablation_summary.csv
+/root/autodl-tmp/pregated_formal_runs/ratio_order_ablation_seed0/ablation_analysis/ratio_order_ablation_effects.csv
+```
+
+Use `ratio_order_ablation_effects.csv` to answer:
+
+- does ratio shift alone degrade prefetch?
+- does order shift alone degrade prefetch?
+- is the combined ratio+order condition stronger than either single axis?
 
 ## 4. Multi-seed rerun
 

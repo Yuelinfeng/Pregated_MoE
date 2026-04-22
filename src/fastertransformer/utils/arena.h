@@ -9,6 +9,7 @@
 #include <future>
 #include <fstream>
 #include <algorithm>
+#include <utility>
 #include "src/fastertransformer/utils/cuda_utils.h"
 #include "src/fastertransformer/utils/config.h"
 #include "src/fastertransformer/utils/profiling.h"
@@ -17,6 +18,53 @@
 #include "cache.h"
 
 namespace fastertransformer {
+
+struct ArenaAllocation {
+    std::future<void> future;
+    bool              cache_hit = false;
+    cudaEvent_t       completion_event = nullptr;
+
+    ArenaAllocation() = default;
+
+    ArenaAllocation(std::future<void>&& future_arg, bool cache_hit_arg, cudaEvent_t completion_event_arg):
+        future(std::move(future_arg)),
+        cache_hit(cache_hit_arg),
+        completion_event(completion_event_arg)
+    {
+    }
+
+    ArenaAllocation(const ArenaAllocation&) = delete;
+    ArenaAllocation& operator=(const ArenaAllocation&) = delete;
+
+    ArenaAllocation(ArenaAllocation&& other) noexcept:
+        future(std::move(other.future)),
+        cache_hit(other.cache_hit),
+        completion_event(other.completion_event)
+    {
+        other.completion_event = nullptr;
+    }
+
+    ArenaAllocation& operator=(ArenaAllocation&& other) noexcept
+    {
+        if (this != &other) {
+            if (completion_event != nullptr) {
+                cudaEventDestroy(completion_event);
+            }
+            future = std::move(other.future);
+            cache_hit = other.cache_hit;
+            completion_event = other.completion_event;
+            other.completion_event = nullptr;
+        }
+        return *this;
+    }
+
+    ~ArenaAllocation()
+    {
+        if (completion_event != nullptr) {
+            cudaEventDestroy(completion_event);
+        }
+    }
+};
 
 template <typename T>
 class MemoryArena {
@@ -58,8 +106,11 @@ public:
     // Allocate a chunk
     // note: tag < 0 is reserved
     // post_callback is used to do further operations on cached data
-    std::future<void> allocate(const tag_t& tag, T* dst = nullptr, const T* src = nullptr, 
-                               std::function<void(const T*, cudaStream_t)> post_callback = nullptr);
+    ArenaAllocation allocate(const tag_t& tag,
+                             T*           dst = nullptr,
+                             const T*     src = nullptr,
+                             std::function<void(const T*, cudaStream_t)> post_callback = nullptr,
+                             bool         record_completion_event = false);
 
     // Wait until all previous work is done
     void synchronize()
@@ -128,7 +179,10 @@ public:
         arena_->setStream(stream);
     }
 
-    std::future<void> allocate(const tag_t& tag, const std::vector<char*>& dsts, const char* src = nullptr)
+    ArenaAllocation allocate(const tag_t&          tag,
+                             const std::vector<char*>& dsts,
+                             const char*           src = nullptr,
+                             bool                  record_completion_event = false)
     {
         FT_CHECK_WITH_INFO(arena_ != nullptr, "Memory arena uninitialized.");
         FT_CHECK(dsts.size() == tensor_sizes_.size());
@@ -139,7 +193,7 @@ public:
                 ptr += tensor_sizes[i];
             }
         };
-        return arena_->allocate(tag, nullptr, src, post_callback);
+        return arena_->allocate(tag, nullptr, src, post_callback, record_completion_event);
     }
 
     char* mallocBuffer(size_t width, size_t height)

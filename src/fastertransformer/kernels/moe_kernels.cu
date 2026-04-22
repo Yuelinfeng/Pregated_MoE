@@ -603,7 +603,10 @@ size_t CutlassMoeFCRunner<T, WeightType, Enable>::getWorkspaceSize(
     const int buf_size         = pad_to_multiple_of_16(k * num_rows * hidden_size);
     const int interbuf_size    = pad_to_multiple_of_16(k * num_rows * inter_size);
     const int padded_experts   = pad_to_multiple_of_16(num_experts);
-    const int num_moe_inputs   = pad_to_multiple_of_16(k * num_rows);
+    // Keep this in sync with configure_ws_ptrs(). The extra 128 slots are part of
+    // the live workspace layout, so omitting them here under-allocates the runner
+    // workspace and can corrupt subsequent buffers on variable-length requests.
+    const int num_moe_inputs   = 128 + pad_to_multiple_of_16(k * num_rows);
     int       num_softmax_outs = 0;
 
     const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
@@ -611,8 +614,8 @@ size_t CutlassMoeFCRunner<T, WeightType, Enable>::getWorkspaceSize(
         num_softmax_outs = pad_to_multiple_of_16(num_rows * num_experts);
     }
 
-    // softmax output, permuted_rows and permuted_experts have moved to outside of moe kernel, allocate them
-    // in Encoder or Decoder before invoking FfnLayer forward.
+    // Workspace layout for source_rows_, permuted_rows_, permuted_experts_ and
+    // next_expert_scales_ is carved inside configure_ws_ptrs().
     size_t total_ws_bytes = 3 * num_moe_inputs * sizeof(int);  // source_rows_, permuted_rows_, permuted_experts_,
     total_ws_bytes += num_moe_inputs * sizeof(T);              // next_expert_scales_
     total_ws_bytes += buf_size * sizeof(T);                    // permuted_data

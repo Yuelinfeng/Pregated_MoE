@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <future>
@@ -50,20 +51,30 @@ private:
     size_t output_scale_size_per_expert_;
     size_t weight_size_per_expert_;
 
-    size_t num_rows_;
+    size_t num_rows_ = 0;
+    size_t num_rows_capacity_ = 0;
     size_t num_experts_;
 
     bool is_allocate_buffer_;
-    IAllocator* allocator_;
+    IAllocator* allocator_ = nullptr;
 
     std::string next_layer_name_;
     std::string current_layer_name_;
-    std::vector<std::future<void>> futures_;
+    struct TransferTask {
+        ArenaAllocation allocation;
+        int             expert_id = -1;
+        std::string     source_layer;
+        std::string     target_layer;
+        int64_t         prefetch_issue_id = -1;
+        bool            is_prefetch = false;
+    };
+    std::vector<TransferTask> transfer_tasks_;
+    int64_t                   next_prefetch_issue_id_ = 0;
 
-    const char* next_weight_src_;
-    const char* current_weight_src_;
+    const char* next_weight_src_ = nullptr;
+    const char* current_weight_src_ = nullptr;
 
-    int num_active_experts_;
+    int num_active_experts_ = 0;
 
 public:
     cudaStream_t stream;
